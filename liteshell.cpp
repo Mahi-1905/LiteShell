@@ -6,6 +6,7 @@
 #include <sys/wait.h>
 #include <cstring>
 #include <fstream>
+#include <dirent.h> // For ls command
 
 using namespace std;
 
@@ -17,6 +18,8 @@ void handle_cd(const vector<string> &args);
 void handle_help();
 void handle_exit();
 void handle_history(const vector<string> &args);
+void handle_pwd();
+void handle_ls(const vector<string> &args);
 void add_to_history(const string &command);
 
 // Global history vector
@@ -30,16 +33,20 @@ int execute_builtin(const vector<string> &args);
 
 void load_history() {
     ifstream history_file(HISTORY_FILE);
-    string line;
-    while (getline(history_file, line) && command_history.size() < MAX_HISTORY) {
-        command_history.push_back(line);
+    if (history_file) {
+        string line;
+        while (getline(history_file, line) && command_history.size() < MAX_HISTORY) {
+            command_history.push_back(line);
+        }
     }
 }
 
 void save_history() {
     ofstream history_file(HISTORY_FILE);
-    for (const auto& cmd : command_history) {
-        history_file << cmd << endl;
+    if (history_file) {
+        for (const auto& cmd : command_history) {
+            history_file << cmd << endl;
+        }
     }
 }
 
@@ -88,6 +95,11 @@ int main() {
 }
 
 void add_to_history(const string &command) {
+    // Don't add empty commands
+    if (command.empty()) {
+        return;
+    }
+    
     // Don't add consecutive duplicates
     if (!command_history.empty() && command_history.back() == command) {
         return;
@@ -155,7 +167,7 @@ vector<string> parse_command(const string &input) {
 
 bool is_builtin(const string &cmd) {
     static const vector<string> builtins = {
-        "cd", "help", "exit", "history"
+        "cd", "help", "exit", "history", "pwd", "ls"
     };
 
     return find(builtins.begin(), builtins.end(), cmd) != builtins.end();
@@ -171,6 +183,10 @@ int execute_builtin(const vector<string> &args) {
         return -1; // Special return code to indicate shell should exit
     } else if (args[0] == "history") {
         handle_history(args);
+    } else if (args[0] == "pwd") {
+        handle_pwd();
+    } else if (args[0] == "ls") {
+        handle_ls(args);
     }
     return 0;
 }
@@ -192,9 +208,40 @@ void handle_history(const vector<string> &args) {
         }
     }
     
-    int start_index = command_history.size() - show_count;
+    int start_index = max(0, (int)command_history.size() - show_count);
     for (int i = start_index; i < command_history.size(); i++) {
         cout << " " << i + 1 << "  " << command_history[i] << endl;
+    }
+}
+
+void handle_pwd() {
+    char cwd[1024];
+    if (getcwd(cwd, sizeof(cwd)) != nullptr) {
+        cout << cwd << endl;
+    } else {
+        perror("pwd");
+    }
+}
+
+void handle_ls(const vector<string> &args) {
+    string path = ".";
+    if (args.size() > 1) {
+        path = args[1];
+    }
+
+    DIR *dir;
+    struct dirent *ent;
+    if ((dir = opendir(path.c_str())) != nullptr) {
+        while ((ent = readdir(dir)) != nullptr) {
+            // Skip hidden files unless specifically requested
+            if (ent->d_name[0] != '.') {
+                cout << ent->d_name << " ";
+            }
+        }
+        cout << endl;
+        closedir(dir);
+    } else {
+        perror("ls");
     }
 }
 
@@ -222,6 +269,8 @@ void handle_help() {
     cout << "  cd [dir]     - Change directory" << endl;
     cout << "  help         - Show this help message" << endl;
     cout << "  history [n]  - Show command history (last n commands)" << endl;
+    cout << "  pwd          - Print working directory" << endl;
+    cout << "  ls [dir]     - List directory contents" << endl;
     cout << "  exit         - Exit the shell" << endl;
     cout << "Other commands are executed as external programs." << endl;
 }
