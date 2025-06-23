@@ -1,0 +1,3 @@
+Linux is an open-source OS
+Python, Java, C++ are programming languages
+Git is used for version control

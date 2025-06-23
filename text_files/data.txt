@@ -1,0 +1,4 @@
+101,Apple,2.5
+202,Banana,1.8
+303,Orange,3.2
+404,Mango,4.1
