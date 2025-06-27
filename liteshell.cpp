@@ -34,10 +34,7 @@ void setup_readline();
 void reset_terminal();
 void cleanup_terminal();
 void sigint_handler(int sig);
-void execute_pipeline(const vector<vector<string>> &commands, 
-                     const string& input_file = "", 
-                     const string& output_file = "", 
-                     bool append = false);
+void execute_pipeline(const vector<vector<string>> &commands);
 
 // Global variables
 vector<string> command_history;
@@ -189,7 +186,6 @@ vector<string> parse_command(const string &input) {
             continue;
         }
 
-        // Handle operators outside quotes
         if (!in_quote && !in_single_quote && 
             (c == '|' || c == '<' || c == '>' || c == '&')) {
             if (!token.empty()) {
@@ -214,7 +210,6 @@ vector<string> parse_command(const string &input) {
         tokens.push_back(token);
     }
 
-    // Handle wildcard expansion
     vector<string> expanded_tokens;
     for (const auto &token : tokens) {
         if (token.find('*') != string::npos) {
@@ -335,7 +330,6 @@ void handle_alias(const vector<string> &args) {
         string name = definition.substr(0, equal_pos);
         string value = definition.substr(equal_pos + 1);
         
-        // Remove surrounding quotes if present
         if (!value.empty()) {
             if ((value.front() == '\'' && value.back() == '\'') || 
                 (value.front() == '"' && value.back() == '"')) {
@@ -345,7 +339,6 @@ void handle_alias(const vector<string> &args) {
         
         aliases[name] = value;
         
-        // Save to alias file
         ofstream alias_file(".myshell_aliases", ios::app);
         if (alias_file) {
             alias_file << name << "=" << value << endl;
@@ -471,6 +464,11 @@ void handle_ls(const vector<string> &args) {
 }
 
 void handle_cd(const vector<string> &args) {
+    if (!isatty(STDIN_FILENO)) {
+        cerr << "cd: cannot be used in a pipeline" << endl;
+        return;
+    }
+
     if (args.size() == 1) {
         const char *home = getenv("HOME");
         if (home) {
@@ -530,95 +528,89 @@ void handle_exit() {
     exit(0);
 }
 
-void execute_pipeline(const vector<vector<string>> &commands, 
-                     const string& input_file, 
-                     const string& output_file, 
-                     bool append) {
+void execute_pipeline(const vector<vector<string>> &commands) {
     if (commands.empty()) return;
     
-    int num_commands = commands.size();
-    int pipefds[2 * (num_commands - 1)];
-    
-    // Create all pipes needed
-    for (int i = 0; i < num_commands - 1; i++) {
-        if (pipe(pipefds + i * 2) < 0) {
-            perror("pipe");
-            return;
-        }
+    // Handle single builtin command specially (no pipe needed)
+    if (commands.size() == 1 && is_builtin(commands[0][0])) {
+        execute_builtin(commands[0]);
+        return;
     }
-    
+
+    int num_commands = commands.size();
+    int prev_pipe_read = -1;
     vector<pid_t> pids;
-    
-    // Fork for each command in the pipeline
+
     for (int i = 0; i < num_commands; i++) {
-        pid_t pid = fork();
+        int pipefd[2];
         
+        // Create pipe for all commands except the last one
+        if (i < num_commands - 1) {
+            if (pipe(pipefd) < 0) {
+                perror("pipe");
+                return;
+            }
+        }
+
+        pid_t pid = fork();
         if (pid == 0) { // Child process
-            // Set up input redirection for first command
-            if (i == 0 && !input_file.empty()) {
-                int fd = open(input_file.c_str(), O_RDONLY);
-                if (fd < 0) {
-                    perror("open input file");
-                    exit(EXIT_FAILURE);
-                }
-                dup2(fd, STDIN_FILENO);
-                close(fd);
-            }
-            
-            // Set up output redirection for last command
-            if (i == num_commands - 1 && !output_file.empty()) {
-                int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
-                int fd = open(output_file.c_str(), flags, 0644);
-                if (fd < 0) {
-                    perror("open output file");
-                    exit(EXIT_FAILURE);
-                }
-                dup2(fd, STDOUT_FILENO);
-                close(fd);
-            }
-            
-            // Connect pipes between commands
+            // If not first command, connect previous pipe to stdin
             if (i > 0) {
-                dup2(pipefds[(i-1)*2], STDIN_FILENO);
+                dup2(prev_pipe_read, STDIN_FILENO);
+                close(prev_pipe_read);
             }
+
+            // If not last command, connect current pipe to stdout
             if (i < num_commands - 1) {
-                dup2(pipefds[i*2+1], STDOUT_FILENO);
+                close(pipefd[0]); // Close read end in child
+                dup2(pipefd[1], STDOUT_FILENO);
+                close(pipefd[1]);
             }
-            
-            // Close all pipe file descriptors
-            for (int j = 0; j < 2 * (num_commands - 1); j++) {
-                close(pipefds[j]);
-            }
-            
-            // Prepare arguments for execvp
-            vector<char*> argv;
-            for (const auto &arg : commands[i]) {
-                argv.push_back(const_cast<char*>(arg.c_str()));
-            }
-            argv.push_back(nullptr);
-            
+
             // Execute the command
-            execvp(argv[0], argv.data());
-            perror("execvp");
-            exit(EXIT_FAILURE);
+            if (is_builtin(commands[i][0])) {
+                execute_builtin(commands[i]);
+                exit(EXIT_SUCCESS);
+            } else {
+                vector<char*> argv;
+                for (const auto &arg : commands[i]) {
+                    argv.push_back(const_cast<char*>(arg.c_str()));
+                }
+                argv.push_back(nullptr);
+
+                execvp(argv[0], argv.data());
+                perror("execvp");
+                exit(EXIT_FAILURE);
+            }
         } else if (pid < 0) {
             perror("fork");
             return;
         }
-        
+
+        // Parent process
+        // Close previous pipe read end if it exists
+        if (i > 0) {
+            close(prev_pipe_read);
+        }
+
+        // Save read end of current pipe for next command
+        if (i < num_commands - 1) {
+            close(pipefd[1]); // Close write end in parent
+            prev_pipe_read = pipefd[0];
+        }
+
         pids.push_back(pid);
     }
-    
-    // Parent process - close all pipe file descriptors
-    for (int i = 0; i < 2 * (num_commands - 1); i++) {
-        close(pipefds[i]);
+
+    // Close last pipe read end if it exists
+    if (prev_pipe_read != -1) {
+        close(prev_pipe_read);
     }
-    
-    // Wait for all child processes to complete
+
+    // Wait for all children to complete
     for (pid_t pid : pids) {
         waitpid(pid, nullptr, 0);
     }
-    reset_terminal();
 }
 
 int execute_command(const vector<string> &args) {
@@ -671,11 +663,6 @@ int execute_command(const vector<string> &args) {
         }
     }
     
-    // Check for built-in commands
-    if (!cmd_args.empty() && is_builtin(cmd_args[0])) {
-        return execute_builtin(cmd_args);
-    }
-    
     // Process pipelines
     vector<vector<string>> pipe_commands;
     vector<string> current_command;
@@ -696,11 +683,15 @@ int execute_command(const vector<string> &args) {
     }
     
     if (pipe_commands.size() > 1) {
-        execute_pipeline(pipe_commands, input_file, output_file, append);
+        execute_pipeline(pipe_commands);
         return 0;
     }
     
     // Handle simple command with redirection
+    if (!cmd_args.empty() && is_builtin(cmd_args[0])) {
+        return execute_builtin(cmd_args);
+    }
+    
     if (!input_file.empty() || !output_file.empty()) {
         pid_t pid = fork();
         
